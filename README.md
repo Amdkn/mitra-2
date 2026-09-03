@@ -10,6 +10,7 @@ tags:
 # mitra-finetune
 
 Fine-tuning for the second-generation pretrained [Mitra v2](https://huggingface.co/autogluon/mitra-classifier-2) tabular foundation-model checkpoints.
+The [Mitra-v2 Technical Report](https://huggingface.co/autogluon/mitra-finetune/blob/main/Mitra_v2_Technical_Report.pdf) describes the model and the evaluation behind the numbers below; the arXiv link will be added once the report is public.
 
 Point at a checkpoint and fit:
 
