@@ -1,3 +1,12 @@
+---
+license: apache-2.0
+tags:
+- tabular
+- tabular-classification
+- tabular-regression
+- foundation-model
+---
+
 # mitra-finetune
 
 Fine-tuning for the second-generation pretrained [Mitra v2](https://huggingface.co/autogluon/mitra-classifier-2) tabular foundation-model checkpoints.
@@ -84,8 +93,11 @@ AutoGluon wrapper, the exact protocol behind the reported numbers.
 pip install "autogluon.tabular[mitra]>=1.6" "tabarena>=0.1.0"
 # 2. Flash-attention (optional but required for realistic speed; prebuilt wheel strongly recommended)
 pip install flash-attn --no-build-isolation
-# 3. This package
-pip install git+https://huggingface.co/autogluon/mitra-finetune
+# 3. This package. The Hub's git server does not support pip's partial clone
+#    (`pip install git+https://...` fails), so clone first, or use uv:
+#    `uv pip install git+https://huggingface.co/autogluon/mitra-finetune`
+git clone https://huggingface.co/autogluon/mitra-finetune
+pip install ./mitra-finetune
 ```
 
 Note on torch: `autogluon.tabular[mitra]` may resolve to the newest
@@ -110,7 +122,7 @@ The reported benchmark numbers were calibrated on the fallback path, so
 results remain comparable either way; installing flash-attn simply fits
 more steps per budget. A notice is logged at fit time if it is missing.
 
-Or from a clone:
+For development, install the clone in editable mode:
 
 ```bash
 git clone https://huggingface.co/autogluon/mitra-finetune
