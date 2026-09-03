@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mitra-finetune"
+version = "0.1.0"
+description = "Fine-tuning for pretrained Mitra tabular foundation-model checkpoints"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Boran Han" }]
+dependencies = [
+    "numpy>=1.24",
+    "scikit-learn>=1.4",
+    "torch>=2.1",
+]
+
+[project.optional-dependencies]
+full = ["autogluon.tabular[mitra]>=1.6", "tabarena>=0.1.0"]
+dev = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
