@@ -5,12 +5,13 @@ tags:
 - tabular-classification
 - tabular-regression
 - foundation-model
+- arxiv:2609.04540
 ---
 
 # mitra-finetune
 
 Fine-tuning for the second-generation pretrained [Mitra v2](https://huggingface.co/autogluon/mitra-classifier-2) tabular foundation-model checkpoints.
-The [Mitra-v2 Technical Report](https://huggingface.co/autogluon/mitra-finetune/blob/main/Mitra_v2_Technical_Report.pdf) describes the model and the evaluation behind the numbers below; the arXiv link will be added once the report is public.
+The [Mitra-v2 Technical Report](https://arxiv.org/abs/2609.04540) (also on the [Hub](https://huggingface.co/autogluon/mitra-finetune/blob/main/Mitra_v2_Technical_Report.pdf)) describes the model and the evaluation behind the numbers below.
 
 Point at a checkpoint and fit:
 
@@ -223,3 +224,16 @@ Apache-2.0. See [`LICENSE`](LICENSE).
 ## Evaluation results
 
 Our TabArena evaluation results for the released checkpoints can be found in [results/](results/).
+
+## Reference
+
+[Mitra-v2 Technical Report](https://arxiv.org/abs/2609.04540) (Amazon, 2026), also available on the [Hub](https://huggingface.co/autogluon/mitra-finetune/blob/main/Mitra_v2_Technical_Report.pdf).
+
+```
+@article{mitrav2_2026,
+  title={{Mitra-v2} Technical Report},
+  author={Tao, Yefan and Zhang, Xiyuan and Liu, Xinyi and Han, Boran and Maddix, Danielle and Fang, Haoyang and Han, Zhen and Gai, Jiading and Liu, Xuanqing and Bohlke-Schneider, Michael and Wang, Yuyang (Bernie) and Friedland, Gerald and Mah, Kevan and Lee, Chris and Kong, Chris},
+  journal={arXiv preprint arXiv:2609.04540},
+  year={2026}
+}
+```
