@@ -39,6 +39,7 @@ from .patches import (
     install_support_cache_patch,
     install_predict_support_cap_patch,
     install_protocol_patches,
+    capture_regression_distribution,
     install_reg_ce_patches,
     install_support_cap_patch,
     install_support_select_patch,
@@ -484,6 +485,56 @@ def _install_predict_chunk_patch(chunk: int) -> None:
     Layer._pred_chunk_patched = True
 
 
+@contextmanager
+def _distribution_scope(enabled: bool):
+    """``capture_regression_distribution`` when enabled, else a no-op yielding None."""
+    if not enabled:
+        yield None
+        return
+    with capture_regression_distribution() as collector:
+        yield collector
+
+
+def _save_regression_distribution(work, wrapper, X_test, test_proba, collector):
+    """Write every bag child's bin distribution for the final test predictions.
+
+    ``collector`` wraps the pass that produced ``test_proba`` (the
+    heldout-in-support re-predict, on by default). Without one the final
+    predictions came straight out of ``fit_custom`` and the distribution is
+    taken from one extra forward-only pass over ``X_test``, which reproduces
+    the point predictions unless the training table exceeds the predict-time
+    support cap (the gap is logged). Guard: the members' point predictions
+    must average to the bagged predictions of the same pass, so no child is
+    missing or counted twice (each member's own histogram mean is checked in
+    the collector).
+    """
+    reference = np.asarray(test_proba, dtype=np.float64).reshape(-1)
+    if collector is None:
+        with capture_regression_distribution() as collector:
+            reference = np.asarray(wrapper.predict(X_test), dtype=np.float64).reshape(-1)
+        gap = float(np.max(np.abs(reference - np.asarray(test_proba).reshape(-1))))
+        print(
+            "[mitra-finetune] distribution: taken from a separate forward pass "
+            f"(heldout-in-support off); max |gap| to the point predictions = {gap:.3g}",
+            flush=True,
+        )
+    edges, probs, points = collector.stacked()
+    bagged = points.mean(axis=0)
+    span = float(edges.max() - edges.min())
+    if not np.allclose(bagged, reference, rtol=1e-5, atol=1e-6 * span):
+        raise RuntimeError(
+            "bag members' point predictions do not average to the bagged "
+            f"predictions (max gap {float(np.max(np.abs(bagged - reference))):.3g}); "
+            f"{probs.shape[0]} members captured"
+        )
+    print(
+        f"[mitra-finetune] distribution: {probs.shape[0]} bag members x "
+        f"{probs.shape[1]} rows x {probs.shape[2]} bins captured",
+        flush=True,
+    )
+    np.savez(work / "test_distribution.npz", bin_edges=edges, probabilities=probs)
+
+
 def child_main(work_dir: str, reseed: bool = True) -> None:
     """Run one bagged view fit described by the payload in ``work_dir``.
 
@@ -501,6 +552,11 @@ def child_main(work_dir: str, reseed: bool = True) -> None:
     view = ViewSpec(**spec)
     problem_type = payload.get("problem_type")
     is_regression = problem_type == "regression"
+    # Regression only (predict_distribution): also return every bag child's
+    # bin distribution for the FINAL test predictions, captured around the
+    # forward-only pass that produces them (see _save_regression_distribution).
+    _want_dist = bool(is_regression and payload.get("return_distribution"))
+    _dist_capture = None
     if not is_regression:
         # The eval harness passes problem_type="classification"; the
         # binary-vs-multiclass distinction that the quantile-transform gate
@@ -935,7 +991,13 @@ def child_main(work_dir: str, reseed: bool = True) -> None:
         _si_vs._mitra_val_in_support_active = bool(_val_in_sup)
         try:
             if is_regression:
-                _ext = np.asarray(wrapper.predict(_X_ext), dtype=np.float64)
+                if _want_dist and _val_head:
+                    raise RuntimeError(
+                        "return_distribution does not support validation-role "
+                        "query rows"
+                    )
+                with _distribution_scope(_want_dist) as _dist_capture:
+                    _ext = np.asarray(wrapper.predict(_X_ext), dtype=np.float64)
             else:
                 _ext = _normalize_probabilities(
                     wrapper.predict_proba(_X_ext),
@@ -977,9 +1039,10 @@ def child_main(work_dir: str, reseed: bool = True) -> None:
         _si_vs._mitra_val_in_support_active = True
         try:
             if is_regression:
-                test_proba = np.asarray(
-                    wrapper.predict(X_test), dtype=np.float64
-                )
+                with _distribution_scope(_want_dist) as _dist_capture:
+                    test_proba = np.asarray(
+                        wrapper.predict(X_test), dtype=np.float64
+                    )
             else:
                 test_proba = _normalize_probabilities(
                     wrapper.predict_proba(X_test),
@@ -993,6 +1056,11 @@ def child_main(work_dir: str, reseed: bool = True) -> None:
             f"{len(X_test)} query rows with each bag child's held-out fold "
             "added to its support",
             flush=True,
+        )
+
+    if _want_dist:
+        _save_regression_distribution(
+            work, wrapper, X_test, test_proba, _dist_capture
         )
 
     np.save(work / "val_proba.npy", val_proba)
@@ -1058,8 +1126,14 @@ def run_view(
     num_bag_folds: int = NUM_BAG_FOLDS,
     gate_cap: int | None = None,
     val_query_rows: int = 0,
-) -> tuple[np.ndarray, np.ndarray]:
+    return_distribution: bool = False,
+) -> tuple:
     """Train one bagged view and return ``(oof_val_proba, test_proba)``.
+
+    With ``return_distribution=True`` (regression only) a third element is
+    returned: ``{"bin_edges": [M, n_bins + 1], "probabilities": [M, n_test,
+    n_bins]}``, the bag children's bin distributions behind ``test_proba``
+    (see ``_save_regression_distribution``).
 
     ``in_process=True`` runs the fit in the calling process (reference
     harness shape: one long-lived process per GPU, seeded once at startup,
@@ -1067,6 +1141,11 @@ def run_view(
     process-global patches, so a second distinct view in the same process
     raises. ``in_process=False`` runs it in a fresh subprocess.
     """
+    if return_distribution and problem_type != "regression":
+        raise ValueError(
+            "return_distribution is regression-only; got "
+            f"problem_type={problem_type!r}"
+        )
     view = _ft_env_view(view)
     with tempfile.TemporaryDirectory(prefix="mitra_view_") as tmp:
         work = Path(tmp)
@@ -1089,6 +1168,7 @@ def run_view(
                     # Leading X_test rows that are validation-role queries;
                     # only read when MITRA_VAL_IN_SUPPORT=1.
                     "val_query_rows": int(val_query_rows),
+                    "return_distribution": bool(return_distribution),
                     "device": device,
                     "problem_type": problem_type,
                 },
@@ -1112,7 +1192,13 @@ def run_view(
                     f"View {view.name!r} failed:\n{result.stdout[-2000:]}"
                     f"\n{result.stderr[-2000:]}"
                 )
-        return (
-            np.load(work / "val_proba.npy"),
-            np.load(work / "test_proba.npy"),
-        )
+        val_proba = np.load(work / "val_proba.npy")
+        test_proba = np.load(work / "test_proba.npy")
+        if not return_distribution:
+            return val_proba, test_proba
+        with np.load(work / "test_distribution.npz") as saved:
+            distribution = {
+                "bin_edges": saved["bin_edges"],
+                "probabilities": saved["probabilities"],
+            }
+        return val_proba, test_proba, distribution

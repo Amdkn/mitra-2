@@ -155,7 +155,42 @@ MitraFinetune(
   time; the out-of-fold validation probabilities are exposed as
   `model.val_proba_`.)
 - `predict(X_test)`: argmax of `predict_proba` (classification), or
-  continuous point predictions (regression).
+  continuous point predictions (regression): the mean of the predicted
+  distribution over the checkpoint's 1,000 target bins.
+- `predict_distribution(X_test)` (regression): the same bagged fit as
+  `predict`, returning the predicted distribution itself as a
+  `RegressionDistribution` (below); `predict(X_test, output_type="full")` is
+  an alias. Call it instead of `predict` when you need both and read the
+  point predictions from `dist.point_prediction`.
+
+## Distributional regression
+
+The regressor casts regression as classification over 1,000 target bins, so
+each bag child predicts a histogram per row and `predict` reports its mean.
+`predict_distribution` returns the histograms for probabilistic scoring:
+
+```python
+dist = model.predict_distribution(X_test)      # one bagged fit, like predict()
+point = dist.point_prediction                  # the predict() output of this fit
+crps = dist.crps(y_test).mean()                # exact CRPS, target units
+log_score = -dist.log_prob(y_test).mean()      # log_prob is -inf where the density is 0
+q10, q50, q90 = dist.quantile([0.1, 0.5, 0.9]).T
+edges, probs = dist.bin_edges, dist.probabilities   # raw per-child histograms
+```
+
+`bin_edges` has shape `(n_children, 1001)` and `probabilities`
+`(n_children, n_test, 1000)`, in target units. Each child bins the target on a
+fixed grid in its own normalized space (`linspace(-0.5, 1.5, 1001)` over the
+training-fold range), so the children's grids can differ, and the bagged
+predictive distribution is the equal-weight mixture of their histograms.
+`RegressionDistribution` evaluates that mixture exactly, treating each bin's
+mass as uniform within the bin: `mean`, `cdf`, `pdf`, `log_prob`, `quantile`,
+`crps`. By default the histograms are captured from the same forward pass that
+produces the point predictions, so `dist.mean` reproduces `point_prediction`
+up to float32 rounding; with `MITRA_HELDOUT_IN_SUPPORT=0` they come from one
+extra forward-only pass over `X_test` and can differ above the predict-time
+support cap (the gap is logged). Memory is about 32 KB per test row with eight
+children.
 
 ## Fast prediction (on by default)
 

@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from .checkpoint import resolve_checkpoint
+from .distribution import RegressionDistribution
 from .feature_selection import select_features, take_columns, take_rows
 from .hierarchy import NodePrediction, hierarchical_predict_proba
 from .modes import BASELINE
@@ -211,11 +212,13 @@ class MitraFinetune:
         self._fit_data = (X, y, X_val, y_val)
         return self
 
-    def _execute_view(self, X_test):
+    def _execute_view(self, X_test, *, return_distribution: bool = False):
         """Run the bagged fit, returning (val, test) predictions.
 
         Each value is a probability matrix (classification) or a vector of
-        continuous point predictions (regression).
+        continuous point predictions (regression). With
+        ``return_distribution=True`` (regression) a third element carries the
+        bag children's bin distributions behind the test predictions.
         """
         X_train, y_train, X_val, y_val = self._fit_data
         if getattr(self, "_ksel_idx", None) is not None:
@@ -251,6 +254,7 @@ class MitraFinetune:
             # validation-role queries (0 outside the hierarchy).
             # Ignored unless MITRA_VAL_IN_SUPPORT=1.
             val_query_rows=getattr(self, "_val_query_head", 0),
+            return_distribution=return_distribution,
         )
 
     def _predict_native_proba(self, X_test) -> np.ndarray:
@@ -369,11 +373,67 @@ class MitraFinetune:
             return self._predict_hierarchical_proba(X_test)
         return self._predict_native_proba(X_test)
 
-    def predict(self, X_test) -> np.ndarray:
+    def predict(self, X_test, output_type: str = "mean"):
+        """Predict ``X_test``: class labels (classification) or targets (regression).
+
+        Regression ``output_type``: ``"mean"`` (default) returns the point
+        predictions, the mean of the predicted bin distribution; ``"full"``
+        returns the distribution itself (see ``predict_distribution``).
+        """
+        if output_type not in ("mean", "full"):
+            raise ValueError(
+                f"Unknown output_type {output_type!r}; expected 'mean' or 'full'"
+            )
         if self.problem_type == "regression":
+            if output_type == "full":
+                return self.predict_distribution(X_test)
             if self._fit_data is None:
                 raise RuntimeError("fit() must be called before predict()")
             val_pred, test_pred = self._execute_view(X_test)
             self.val_proba_ = np.asarray(val_pred, dtype=np.float64)
             return np.asarray(test_pred, dtype=np.float64)
+        if output_type != "mean":
+            raise RuntimeError(
+                "output_type='full' is regression-only; call predict_proba() "
+                "for class probabilities"
+            )
         return np.argmax(self.predict_proba(X_test), axis=1)
+
+    def predict_distribution(self, X_test) -> RegressionDistribution:
+        """Predict the full regression distribution of every row of ``X_test``.
+
+        Runs the same bagged fine-tune as ``predict`` (one fit per call; read
+        the point predictions from ``.point_prediction`` instead of calling
+        ``predict`` again). Each bag child predicts a categorical distribution
+        over the checkpoint's 1,000 target bins on its own grid in target
+        units; the returned :class:`RegressionDistribution` holds every
+        child's bin edges and probabilities and evaluates their equal-weight
+        mixture exactly (``mean``, ``cdf``, ``pdf``/``log_prob``,
+        ``quantile``, ``crps``). Memory: about ``4 * n_members * n_bins``
+        bytes per test row (32 KB at 8 children). ``val_proba_`` is set as
+        for ``predict``.
+
+        By default the histograms are captured from the same forward pass that
+        produces the point predictions, so ``mean`` reproduces
+        ``point_prediction`` up to float32 rounding. With
+        ``MITRA_HELDOUT_IN_SUPPORT=0`` (and ``MITRA_VAL_IN_SUPPORT`` off) they
+        come from one additional forward-only pass over ``X_test``; above the
+        predict-time support cap that pass draws its own support subsample, so
+        ``mean`` can then differ from ``point_prediction`` (the gap is logged).
+        """
+        if self.problem_type != "regression":
+            raise RuntimeError(
+                "predict_distribution is regression-only; call predict_proba() "
+                "for class probabilities"
+            )
+        if self._fit_data is None:
+            raise RuntimeError("fit() must be called before predict_distribution()")
+        val_pred, test_pred, distribution = self._execute_view(
+            X_test, return_distribution=True
+        )
+        self.val_proba_ = np.asarray(val_pred, dtype=np.float64)
+        return RegressionDistribution(
+            bin_edges=distribution["bin_edges"],
+            probabilities=distribution["probabilities"],
+            point_prediction=np.asarray(test_pred, dtype=np.float64),
+        )

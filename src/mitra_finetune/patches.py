@@ -5,6 +5,7 @@ gate caps, local from_pretrained) in the child subprocess before any fit runs.
 """
 from __future__ import annotations
 
+import contextlib
 import inspect
 import textwrap
 
@@ -74,8 +75,16 @@ def install_reg_ce_patches(n_bins: int) -> None:
     2. ``TrainerFinetune.evaluate``/``predict`` decode with the mean over bin
        centers instead of argmax (see ``_mean_decode_source``).
 
+    ``predict`` is additionally wrapped so that, inside a
+    ``capture_regression_distribution`` block, every trainer predict call (one
+    per bag child) hands its bin distribution to the collector before the mean
+    decode collapses it; outside such a block the wrapper is a pass-through.
+
     Applied on the base class BEFORE ``install_view``, so the ``ViewTrainer``
-    subclass inherits the mean decode through its ``super()`` calls.
+    subclass inherits the mean decode through its ``super()`` calls, and
+    BEFORE the predict-time speed/cap wrappers, so an OOM retry by an outer
+    wrapper re-enters the capture afresh (a failed attempt's chunks are
+    discarded, never double counted).
     """
     import autogluon.tabular.models.mitra._internal.core.trainer_finetune \
         as trainer_module
@@ -105,9 +114,27 @@ def install_reg_ce_patches(n_bins: int) -> None:
     trainer_module.TrainerFinetune.evaluate = _mean_decode_source(
         trainer_module.TrainerFinetune.evaluate, numpy_variant=False
     )
-    trainer_module.TrainerFinetune.predict = _mean_decode_source(
+    decoded_predict = _mean_decode_source(
         trainer_module.TrainerFinetune.predict, numpy_variant=True
     )
+
+    def predict_with_distribution_capture(self, x_support, y_support, x_query):
+        collector = _REG_DIST_CAPTURE["collector"]
+        if collector is None:
+            return decoded_predict(self, x_support, y_support, x_query)
+        collector.begin_call(self, n_query=len(x_query))
+        try:
+            y_pred = decoded_predict(self, x_support, y_support, x_query)
+        except BaseException:
+            collector.abort_call()
+            raise
+        collector.end_call(self, y_pred)
+        return y_pred
+
+    # Module global read by the rewritten decode (its globals are the trainer
+    # module's); None outside a capture block.
+    trainer_module._mitra_finetune_distribution_sink = None
+    trainer_module.TrainerFinetune.predict = predict_with_distribution_capture
     sklearn_interface._mitra_finetune_reg_ce_patched = True
 
 
@@ -507,6 +534,10 @@ def _mean_decode_source(fn, *, numpy_variant: bool):
     swaps only those lines, leaving the rest of the method byte-identical. If
     AutoGluon ever changes the decode, the two needles stop matching and this
     raises loudly instead of mis-decoding.
+
+    The ``predict`` (numpy) variant also hands each chunk's softmax to
+    ``_mitra_finetune_distribution_sink`` (a trainer-module global, None
+    unless ``capture_regression_distribution`` is active) before the mean.
     """
     source = textwrap.dedent(inspect.getsource(fn))
     lines = source.split("\n")
@@ -519,7 +550,10 @@ def _mean_decode_source(fn, *, numpy_variant: bool):
             "if not torch.isfinite(_logits).all():\n"
             "    _logits = torch.nan_to_num(_logits, nan=0.0, posinf=1e4, neginf=-1e4)\n"
             "_centers = (self.bins[:-1] + self.bin_width / 2).cpu()\n"
-            "y_hat = (torch.softmax(_logits, dim=-1) * _centers).sum(dim=-1).numpy()"
+            "_probs = torch.softmax(_logits, dim=-1)\n"
+            "if _mitra_finetune_distribution_sink is not None:\n"
+            "    _mitra_finetune_distribution_sink(self, _probs)\n"
+            "y_hat = (_probs * _centers).sum(dim=-1).numpy()"
         )
     else:
         argmax_needle = "y_hat = torch.argmax(y_hat, dim=-1)"
@@ -549,6 +583,162 @@ def _mean_decode_source(fn, *, numpy_variant: bool):
     exec(compile("\n".join(lines), f"<mitra_finetune reg-decode {fn.__name__}>", "exec"),
          fn.__globals__, namespace)
     return namespace[fn.__name__]
+
+
+# -- Regression predictive distribution capture --------------------------------
+# At most one collector is active (set by capture_regression_distribution);
+# the reg-CE predict wrapper installed by install_reg_ce_patches consults it.
+_REG_DIST_CAPTURE = {"collector": None}
+
+
+def _member_grid_in_target_units(trainer, probs: np.ndarray):
+    """Map one trainer's bin grid and probabilities to the original target units.
+
+    The trainer bins the NORMALIZED target: ``self.bins`` is
+    ``linspace(-0.5, 1.5, n_bins + 1)`` over ``(y - y_min) / (y_max - y_min)``
+    of the child's fit data, and the stock ``inverse_transform_y`` undoes an
+    optional mirror (``y -> 1 - y``) and then the min-max scaling. Both steps
+    are affine, so the bin edges map exactly; the mirror reverses the bin
+    order, so the probabilities are flipped along with the edges to keep them
+    ascending. Returns ``(edges [n_bins + 1] float64, probs [n, n_bins])``.
+    """
+    import torch
+
+    edges = trainer.bins.detach().to(device="cpu", dtype=torch.float64).numpy()
+    preprocessor = trainer.preprocessor
+    mirrored = bool(getattr(preprocessor, "random_mirror_regression", False)) and bool(
+        getattr(preprocessor, "regression_mirror", False)
+    )
+    if mirrored:
+        edges = (1.0 - edges)[::-1]
+        probs = probs[:, ::-1]
+    y_min = float(preprocessor.y_min)
+    y_max = float(preprocessor.y_max)
+    edges = edges * (y_max - y_min) + y_min
+    return np.ascontiguousarray(edges), np.ascontiguousarray(probs)
+
+
+class _RegressionDistributionCollector:
+    """Collects one bin distribution per trainer predict call (= per bag member).
+
+    ``begin_call``/``end_call`` bracket one ``TrainerFinetune.predict`` call;
+    ``on_chunk`` receives the softmax of every query chunk in between (the
+    rewritten decode calls it with the chunk's ``[rows, n_bins]`` CPU tensor).
+    ``end_call`` checks that the chunks cover exactly the call's query rows,
+    maps the grid to target units, and verifies that the histogram mean
+    reproduces the call's own decoded point predictions, which pins the
+    affine mapping (mirror included) to the stock decode.
+    """
+
+    def __init__(self) -> None:
+        self.members: list[tuple[np.ndarray, np.ndarray]] = []
+        self.points: list[np.ndarray] = []
+        self._call = None
+
+    def begin_call(self, trainer, n_query: int) -> None:
+        if self._call is not None:
+            raise RuntimeError("nested trainer predict calls are not expected")
+        self._call = {"trainer": trainer, "n_query": int(n_query), "chunks": []}
+
+    def on_chunk(self, trainer, probs) -> None:
+        if self._call is None or self._call["trainer"] is not trainer:
+            raise RuntimeError(
+                "regression distribution chunk received outside its predict call"
+            )
+        self._call["chunks"].append(
+            np.array(probs.detach().cpu().numpy(), dtype=np.float32, copy=True)
+        )
+
+    def abort_call(self) -> None:
+        self._call = None
+
+    def end_call(self, trainer, y_pred) -> None:
+        call, self._call = self._call, None
+        if call is None or call["trainer"] is not trainer:
+            raise RuntimeError("end_call without a matching begin_call")
+        if not call["chunks"]:
+            raise RuntimeError(
+                "no bin distribution was produced by the predict call; the "
+                "cross-entropy regression decode is not active"
+            )
+        probs = np.concatenate(call["chunks"], axis=0)
+        if probs.shape[0] != call["n_query"]:
+            raise RuntimeError(
+                f"distribution rows {probs.shape[0]} != query rows {call['n_query']}"
+            )
+        edges, probs = _member_grid_in_target_units(trainer, probs)
+        point_raw = np.asarray(y_pred)
+        point = point_raw.astype(np.float64).reshape(-1)
+        if point.shape[0] != probs.shape[0]:
+            raise RuntimeError(
+                f"point predictions {point.shape[0]} != distribution rows {probs.shape[0]}"
+            )
+        centers = 0.5 * (edges[:-1] + edges[1:])
+        # Compare in float64 on renormalized rows. The captured float32 softmax
+        # rows sum to one only to about 1e-6, while the stock decode adds the
+        # target offset y_min exactly once; an unnormalized mean would carry a
+        # y_min * (sum(p) - 1) error that swamps the tolerance whenever
+        # |y_min| >> y_max - y_min (timestamps, pressures in Pa).
+        p64 = probs.astype(np.float64)
+        p64 /= p64.sum(axis=1, keepdims=True)
+        offset = float(edges[0])
+        hist_mean = p64 @ (centers - offset) + offset
+        span = float(edges[-1] - edges[0])
+        scale = max(abs(float(edges[0])), abs(float(edges[-1])))
+        # Both sides carry float64 rounding proportional to the target offset
+        # (the stock decode forms m * range + y_min); without this floor a
+        # target with |offset| / range beyond ~1e12 would fail the check after
+        # the whole bagged fit.
+        tolerance = 1e-4 * span + 1e-12 * scale
+        if point_raw.dtype.itemsize < 8:
+            # The decode stayed in float32 in target units (float32 targets, or
+            # value-based casting); allow its representation error.
+            tolerance += 1e-6 * scale
+        gap = float(np.max(np.abs(hist_mean - point))) if point.size else 0.0
+        if not np.isfinite(gap) or gap > tolerance:
+            raise RuntimeError(
+                "captured bin distribution does not reproduce the decoded point "
+                f"predictions (max gap {gap:.3g} > {tolerance:.3g})"
+            )
+        self.members.append((edges, probs))
+        self.points.append(point)
+
+    def stacked(self):
+        """``(bin_edges [M, n_bins + 1], probabilities [M, n, n_bins], points [M, n])``."""
+        if not self.members:
+            raise RuntimeError("no bag member predicted during the capture block")
+        edges = np.stack([e for e, _ in self.members], axis=0)
+        probs = np.stack([p for _, p in self.members], axis=0)
+        points = np.stack(self.points, axis=0)
+        return edges, probs, points
+
+
+@contextlib.contextmanager
+def capture_regression_distribution():
+    """Collect every bag child's bin distribution during one predict pass.
+
+    Yields a collector whose ``stacked()`` returns the members in call order
+    after the block. Requires ``install_reg_ce_patches`` (the capture hooks
+    live in its predict wrapper and decode). Not re-entrant.
+    """
+    import autogluon.tabular.models.mitra._internal.core.trainer_finetune \
+        as trainer_module
+    import autogluon.tabular.models.mitra.sklearn_interface as sklearn_interface
+
+    if not getattr(sklearn_interface, "_mitra_finetune_reg_ce_patched", False):
+        raise RuntimeError(
+            "capture_regression_distribution needs install_reg_ce_patches first"
+        )
+    if _REG_DIST_CAPTURE["collector"] is not None:
+        raise RuntimeError("capture_regression_distribution is not re-entrant")
+    collector = _RegressionDistributionCollector()
+    _REG_DIST_CAPTURE["collector"] = collector
+    trainer_module._mitra_finetune_distribution_sink = collector.on_chunk
+    try:
+        yield collector
+    finally:
+        trainer_module._mitra_finetune_distribution_sink = None
+        _REG_DIST_CAPTURE["collector"] = None
 
 
 _SUPPORT_CACHE_FREEZE = {"on": False}
