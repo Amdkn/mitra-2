@@ -35,6 +35,7 @@ from .modes import ViewSpec
 from .patches import (
     install_d2h_sync_patch,
     install_fast_predict_patch,
+    install_fitted_context_memo_patch,
     install_gate_cap_patch,
     install_support_cache_patch,
     install_predict_support_cap_patch,
@@ -672,21 +673,18 @@ def child_main(work_dir: str, reseed: bool = True) -> None:
     if _sup_select or _sup_select_ft:
         install_support_select_patch(_sup_select, _sup_select_ft)
 
-    # FAST_PREDICT (default ON): predict-time speed lever. Draw the in-context
-    # support subsample ONCE per test set (stock re-draws it for every query
-    # chunk) and widen the query chunk so most tables predict in a single chunk.
-    # Single-chunk predicts stay bit-exact with stock; multi-chunk predicts move
-    # within evaluation-board noise. Tasks whose support pool EXCEEDS the active
-    # support cap bypass the fast path entirely and run stock predict verbatim
-    # (see install_fast_predict_patch): the stock per-chunk support redraw is an
-    # implicit ensemble over capped subsamples that is quality-bearing there,
-    # and the fast path's wide-chunk OOM retries would slow the first bag fold
-    # enough to trip AutoGluon's bag-truncating time projection. Set
+    # FAST_PREDICT (default ON): predict in 16384-row query chunks whether or
+    # not the support fits the cap (stock: 1024). When the support fits, the
+    # subsample is drawn once per test set (a single-chunk predict is bit-exact
+    # with stock); when it exceeds the cap, every chunk still gets a fresh
+    # capped draw, as in stock, so the prediction is the same in expectation
+    # and 5 to 8 times cheaper (see install_fast_predict_patch). Set
     # MITRA_FAST_PREDICT=0 to restore stock behavior everywhere. Installed
     # BEFORE the support-cap patch so it is the INNER predict wrapper: a
     # predict-time CUDA OOM shrinks the (quality-neutral) query chunk first,
-    # and only escalates to the (quality-costing) support-cap halving once the
-    # query chunk hits its floor.
+    # down to the floor when the support fits and to the stock chunk when it
+    # is capped, and only then escalates to the (quality-costing) support-cap
+    # halving.
     _fast_predict = os.environ.get("MITRA_FAST_PREDICT", "1") == "1"
     _fast_qchunk = max(1, int(os.environ.get("MITRA_FAST_PREDICT_QCHUNK", "16384")))
     _fast_qchunk_floor = max(
@@ -742,6 +740,13 @@ def child_main(work_dir: str, reseed: bool = True) -> None:
     if not view.is_stock:
         from mitra_finetune.hooks import install_view
         install_view(view)
+
+    # FITTED_CONTEXT_MEMO (default ON; MITRA_FITTED_CONTEXT_MEMO=0 disables):
+    # later bag children start at the fine-tuning context that fit the first
+    # child instead of repeating its out-of-memory attempts. Installed LAST so
+    # its _create_config wrapper sees the caps every patch above set.
+    if os.environ.get("MITRA_FITTED_CONTEXT_MEMO", "1") == "1":
+        install_fitted_context_memo_patch()
 
     if reseed:
         # Mitra's fine-tuning consumes the GLOBAL torch RNG stream, so a

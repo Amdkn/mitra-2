@@ -383,52 +383,60 @@ def install_predict_support_cap_patch(pred_cap: int, pred_floor: int) -> None:
     _TF_rc._rc_pred_patched = True
 
 
+def fast_predict_plan(
+    n_support: int, support_cap: int, qchunk: int, qchunk_floor: int, stock_chunk: int
+) -> tuple[bool, int, int]:
+    """How one predict call runs: ``(fixed_support_draw, query_chunk, query_chunk_floor)``.
+
+    When the support pool fits under the active cap no subsample is drawn, so
+    one seeded permutation serves every query chunk (a single-chunk predict is
+    bit-exact with stock) and the out-of-memory ratchet may shrink the chunk
+    down to ``qchunk_floor``. When the pool exceeds the cap every chunk gets a
+    fresh capped draw, as in stock, and the ratchet stops at the stock chunk:
+    below it the prediction would only get slower, never different.
+    """
+    support_fits = not (0 < int(support_cap) < int(n_support))
+    query_chunk = max(int(stock_chunk), int(qchunk))
+    floor = int(qchunk_floor) if support_fits else int(stock_chunk)
+    return support_fits, query_chunk, min(floor, query_chunk)
+
+
 def install_fast_predict_patch(qchunk: int, qchunk_floor: int) -> None:
-    """Predict-only speed lever: draw the support subsample ONCE and widen the
-    query chunk, with a query-chunk-first OOM ratchet.
+    """Predict-only speed lever: wide query chunks, one support draw when the
+    support fits, with a query-chunk-first OOM ratchet.
 
-    SCOPE GUARD: the fast path only runs when the support pool fits under the
-    active ``max_samples_support`` cap. When the pool exceeds the cap, predict
-    runs the STOCK path verbatim: stock's per-chunk support redraw is then an
-    implicit ensemble over capped subsamples (quality-bearing on subsampled
-    large-N tasks), and the fast path's wide-chunk OOM retries there can slow
-    the first bag fold past AutoGluon's fold-time projection, silently
-    truncating the bag. When the support fits fully no subsample is drawn at
-    all, so the fast path below changes nothing but speed.
+    Stock ``TrainerFinetune.predict`` splits the query rows into 1,024-row
+    chunks and ``DatasetFinetune.__getitem__`` draws a fresh support subsample
+    for every chunk, so a test set of K chunks re-encodes the in-context
+    support K times. Predicting in ``qchunk``-row chunks (default 16,384)
+    removes most of that work without touching the support cap:
 
-    Stock ``DatasetFinetune.__getitem__`` re-draws a fresh support subsample
-    (``self.rng.choice``) for EVERY query chunk, so a test set split into K
-    query chunks re-encodes the in-context support K times. Two changes remove
-    that redundant work WITHOUT touching the support cap (so no quality lever
-    moves):
+    1. Support fits under the active cap (the common case): no subsample is
+       drawn at all, so the fast path changes nothing but speed. The
+       ``rng`` state is snapshotted on the first ``__getitem__`` and restored
+       before every later chunk, so the UNMODIFIED stock ``__getitem__`` draws
+       the same support permutation for every chunk (a single-chunk predict is
+       bit-exact with stock; multi-chunk predicts change only which rows the
+       2nd+ chunks see, a within-noise difference). On CUDA OOM the query
+       chunk is halved down to ``qchunk_floor``.
+    2. Support exceeds the cap (large tables): every chunk still gets a fresh
+       capped draw, as in stock, so every query row sees exactly one draw and
+       the prediction is the same in expectation; the chunks are just 16
+       times wider. Paired on the ten TabArena tables in this regime (90
+       splits, RTX PRO 6000, same fleet): 50 wins, 40 losses against the stock
+       chunking, geometric error ratio 1.0001, and 7 times less inference time
+       (APSFailure 1,419 s to 185 s per split). On CUDA OOM the chunk is
+       halved down to the STOCK chunk, never below it: the worst case is the
+       stock path plus a few failed allocations, which is why widening the
+       chunk cannot slow a bag fold past AutoGluon's time projection.
 
-    1. Fixed support draw: snapshot ``self.rng``'s state on the first
-       ``__getitem__`` and restore it before every later chunk, so the stock
-       ``__getitem__``'s own ``self.rng.choice`` draws the SAME support indices
-       for every chunk. This delegates to the UNMODIFIED stock ``__getitem__``
-       (only the RNG is frozen), so the returned batch -- its keys and any
-       per-item transforms -- can never drift from stock; if AutoGluon changes
-       what ``__getitem__`` returns, this inherits the change automatically.
-       The first chunk is byte-identical to stock's (same rng state, same call,
-       and the predict loader is ``shuffle=False``/``num_workers=0`` so idx 0
-       comes first), so a SINGLE-chunk predict is bit-exact with stock.
-       Multi-chunk predicts change only which support rows the 2nd+ chunks see
-       -- a within-noise difference validated on the evaluation boards. This is
-       scoped to predict ONLY (a shared flag flipped on just inside the
-       ``predict`` wrapper): fine-tune and its mid-fit ``evaluate`` keep the
-       stock per-chunk redraw, so the fine-tuning itself (its LR schedule and
-       best-checkpoint selection, which read the validation loss) is
-       byte-for-byte unchanged. The ``__getitem__`` patch is process-global by
-       necessity but inert unless the flag is set. The frozen RNG state is
-       cached on the per-call ``DatasetFinetune`` instance (``predict`` builds a
-       fresh one for every test set), so it cannot leak across test sets.
-    2. Widened query chunk: predict with ``max_samples_query = qchunk`` (default
-       16384 vs the stock 1024) so most tables become single-chunk -- fewer
-       chunks, fewer support re-encodings, and (with #1) bit-exact. Read fresh
-       from ``cfg.hyperparams`` inside ``predict`` and restored afterward, so
-       fine-tune is untouched. On CUDA OOM the QUERY chunk is halved first
-       (down to ``qchunk_floor``) -- purely a batching change, so it is
-       quality-neutral -- and the support cap is left to its own outer ratchet.
+    The fixed support draw is active ONLY while a predict() call in regime 1
+    is on the stack: fit-time ``evaluate`` and regime 2 run the stock per-chunk
+    redraw. The ``__getitem__`` patch is process-global by necessity but inert
+    unless the flag is set; the frozen RNG state is cached on the per-call
+    ``DatasetFinetune`` instance, so it cannot leak across test sets. The
+    chunk is read fresh from ``cfg.hyperparams`` inside ``predict`` and
+    restored afterward, so fine-tuning is untouched.
 
     Install BEFORE ``install_predict_support_cap_patch`` so the support-cap
     wrapper becomes the OUTER predict wrapper: an OOM shrinks the query chunk
@@ -445,10 +453,8 @@ def install_fast_predict_patch(qchunk: int, qchunk_floor: int) -> None:
     if getattr(_TF_fp, "_fast_pred_patched", False):
         return
 
-    # Predict-scope flag shared by the two closures below. The fixed support
-    # draw is active ONLY while a predict() call is on the stack; fit-time
-    # evaluate() (which drives the LR scheduler and best-checkpoint pick) runs
-    # the stock per-chunk redraw, so fine-tuning is byte-for-byte unchanged.
+    # Predict-scope flag shared by the two closures below: set only while a
+    # predict() call whose support fits under the cap is on the stack.
     _state = {"active": False}
 
     # (1) Fixed support draw (predict-scoped). Snapshot the RNG on the first
@@ -470,46 +476,39 @@ def install_fast_predict_patch(qchunk: int, qchunk_floor: int) -> None:
 
     _DF_fp.__getitem__ = _fixed_getitem
 
-    # (2) Widened query chunk with a query-chunk-first OOM ratchet.
+    # (2) Wide query chunk in both regimes, with a query-chunk-first OOM ratchet.
     _fp_orig_pred = _TF_fp.predict
 
     def _fast_pred(self, x_support, y_support, x_query):
-        # Subsample guard: when the support pool EXCEEDS the active support
-        # cap, run stock predict verbatim instead of the fast path. Stock's
-        # per-chunk support redraw is then an implicit ensemble over capped
-        # subsamples -- quality-bearing on subsampled large-N tasks -- and the
-        # fast path's wide-chunk OOM retries there can slow the first bag fold
-        # past AutoGluon's fold-time projection, silently truncating the bag.
-        # When the support fits fully (the common case) no subsample is drawn
-        # at all, so the fast path changes nothing but speed.
+        _hp = self.cfg.hyperparams
         try:
-            _cap_now = int(self.cfg.hyperparams["max_samples_support"])
+            _cap_now = int(_hp["max_samples_support"])
         except (KeyError, TypeError, ValueError):
             _cap_now = 0
-        if 0 < _cap_now < len(x_support):
-            return _fp_orig_pred(self, x_support, y_support, x_query)
-        _old_q = self.cfg.hyperparams["max_samples_query"]
+        _old_q = _hp["max_samples_query"]
+        _fixed, _q, _floor = fast_predict_plan(
+            len(x_support), _cap_now, qchunk, qchunk_floor, int(_old_q)
+        )
         _was_active = _state["active"]
-        _state["active"] = True
-        _q = qchunk
+        _state["active"] = _fixed
         try:
             while True:
-                self.cfg.hyperparams["max_samples_query"] = _q
+                _hp["max_samples_query"] = _q
                 try:
                     return _fp_orig_pred(self, x_support, y_support, x_query)
                 except RuntimeError as _e_fp:
                     if "out of memory" not in str(_e_fp).lower():
                         raise
                     _torch_fp.cuda.empty_cache()
-                    if _q <= qchunk_floor:
+                    if _q <= _floor:
                         raise
-                    _q = max(qchunk_floor, _q // 2)
+                    _q = max(_floor, _q // 2)
                     print(
                         f"[fast-predict] CUDA OOM -> halving query chunk to {_q}",
                         flush=True,
                     )
         finally:
-            self.cfg.hyperparams["max_samples_query"] = _old_q
+            _hp["max_samples_query"] = _old_q
             _state["active"] = _was_active
 
     _TF_fp.predict = _fast_pred
@@ -1019,3 +1018,79 @@ def install_protocol_patches() -> None:
     _BEM.add_child = _add_child
     _BEM._fit_folds = _fit_folds
     _BEM._protocol_patched = True
+
+
+# -- Fitted-context memo -------------------------------------------------------
+# AutoGluon's _train_ensemble halves the fine-tuning context (max_samples_support,
+# then max_samples_query) until a child fits the GPU. The eight children of a bag
+# run one after another in one process on tables of the same shape, so the
+# attempts that failed for the first child fail again for the other seven. The
+# memo records the context that fit, keyed on the table shape and the requested
+# caps, and later children start there; the ratchet stays in place as fallback.
+_FITTED_CONTEXT_MEMO: dict[tuple, tuple[int, int]] = {}
+_FITTED_CONTEXT_PENDING: dict[str, tuple | None] = {"key": None}
+
+
+def fitted_context_key(task, n_rows: int, n_features: int) -> tuple:
+    """Table-shape part of the memo key; rows are bucketed so the eight children of a bag share it."""
+    return (str(task), int(n_features), int(round(int(n_rows) / 256)))
+
+
+def install_fitted_context_memo_patch() -> None:
+    """Start later bag children at the fine-tuning context that fit the first.
+
+    Two wrappers on ``MitraBase``: ``_train_ensemble`` publishes the table
+    shape for the duration of the call and records the caps its trainers ended
+    up with; ``_create_config`` completes the key with the caps requested for
+    the fit and, when an earlier fit of the same key settled on a smaller
+    context, starts from that context instead. Install LAST, so this
+    ``_create_config`` wrapper sees the caps every other patch set. Measured
+    on the TabArena suite (RTX PRO 6000, 96 GB) only APSFailure and
+    kddcup09_appetency (context 4,096) and hiva_agnostic (512) ratchet at all;
+    the memo saves about a minute per split there (2,282 s over 816 splits).
+    """
+    import autogluon.tabular.models.mitra.sklearn_interface as _si_memo
+
+    if getattr(_si_memo.MitraBase, "_fitted_context_memo_patched", False):
+        return
+    _orig_cc = _si_memo.MitraBase._create_config
+    _orig_te = _si_memo.MitraBase._train_ensemble
+
+    def _memo_cc(self, *args, **kwargs):
+        cfg, model_cls = _orig_cc(self, *args, **kwargs)
+        pending = _FITTED_CONTEXT_PENDING["key"]
+        if pending is not None and len(pending) == 3:
+            hp = cfg.hyperparams
+            requested = (int(hp["max_samples_support"]), int(hp["max_samples_query"]))
+            key = pending + requested
+            _FITTED_CONTEXT_PENDING["key"] = key
+            fitted = _FITTED_CONTEXT_MEMO.get(key)
+            if fitted is not None and fitted < requested:
+                print(
+                    "[mitra-finetune] fitted-context memo: starting fine-tuning at "
+                    f"max_samples_support={fitted[0]}, max_samples_query={fitted[1]}, the "
+                    "context that fit this table shape earlier in this process",
+                    flush=True,
+                )
+                hp["max_samples_support"], hp["max_samples_query"] = fitted
+        return cfg, model_cls
+
+    def _memo_te(self, X_train, y_train, X_valid, y_valid, task, dim_output, *args, **kwargs):
+        shape = np.shape(X_train)
+        _FITTED_CONTEXT_PENDING["key"] = fitted_context_key(
+            task, shape[0], shape[1] if len(shape) > 1 else 1
+        )
+        try:
+            result = _orig_te(self, X_train, y_train, X_valid, y_valid, task, dim_output, *args, **kwargs)
+            key = _FITTED_CONTEXT_PENDING["key"]
+            trainers = getattr(self, "trainers", None)
+            if key is not None and len(key) == 5 and trainers:
+                hp = trainers[0].cfg.hyperparams
+                _FITTED_CONTEXT_MEMO[key] = (int(hp["max_samples_support"]), int(hp["max_samples_query"]))
+            return result
+        finally:
+            _FITTED_CONTEXT_PENDING["key"] = None
+
+    _si_memo.MitraBase._create_config = _memo_cc
+    _si_memo.MitraBase._train_ensemble = _memo_te
+    _si_memo.MitraBase._fitted_context_memo_patched = True

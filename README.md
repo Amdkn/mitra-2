@@ -119,10 +119,11 @@ and point `checkpoint_dir` at it. You can pass either a raw `.pt` state dict
 removed the `state_dict_*` hyperparameters; custom weights load via
 `hf_model=<local dir>`, which this package handles for you.
 
-Flash-attn is optional: without it Mitra uses a slower attention fallback.
-The reported benchmark numbers were calibrated on the fallback path, so
-results remain comparable either way; installing flash-attn simply fits
-more steps per budget. A notice is logged at fit time if it is missing.
+Flash-attn is optional. The fine-tuning loop runs on torch's
+`scaled_dot_product_attention` either way (as fast per step as flash-attn 2 on
+an H100, 1.3 to 1.7 times faster on an RTX PRO 6000 Blackwell); prediction
+uses flash-attn when it is installed, which is faster and lighter on memory at
+prediction shapes. A notice is logged at fit time if it is missing.
 
 For development, install the clone in editable mode:
 
@@ -192,29 +193,79 @@ extra forward-only pass over `X_test` and can differ above the predict-time
 support cap (the gap is logged). Memory is about 32 KB per test row with eight
 children.
 
-## Fast prediction (on by default)
+## Speed (on by default)
 
-Prediction is sped up by a factor of about two, on by default, with no change
-to the reported accuracy. Stock AutoGluon Mitra re-draws a fresh in-context
-support subsample for every query chunk, so a large test set re-encodes the
-support many times. This package instead draws the support subsample once per
-test set and widens the query chunk so most tables predict in a single pass.
+Version 0.3 makes the fine-tuning loop and the prediction cheaper without
+changing what a step computes or, in expectation, what is predicted. Every
+item below is on by default and can be switched off with an environment
+variable, read at fit time.
 
-The behavior is quality-preserving by construction: a test set that fits in one
-query chunk is bit-identical to stock, and larger test sets move only within
-benchmark noise (verified on the evaluation suite). Fine-tuning is untouched;
-only the forward-only prediction path changes. On a prediction-time CUDA
-out-of-memory it shrinks the query chunk first (a pure batching change, so
-quality is unaffected) before it touches the support cap.
+### Fine-tuning loop
+
+Four changes to the loop, none to the recipe (`speed.py`, applied through the
+package's trainer subclass):
+
+- The validation pass after every step predicts the validation set in one
+  wide query chunk (16,384 rows) instead of stock's 1,024-row chunks with a
+  fresh support draw each; on large tables that pass cost as much as several
+  steps. The transformed arrays it scores are computed once per fit instead
+  of once per step.
+- Before the first validation pass, one throw-away forward and backward pass
+  at the fine-tuning context size makes a context that does not fit the GPU
+  fail in seconds instead of after a full validation pass; AutoGluon's
+  out-of-memory ratchet then halves the context as before. Later bag children
+  start at the context that fit the first child instead of repeating its
+  failed attempts.
+- The loop's attention runs on torch's `scaled_dot_product_attention`, which
+  matches flash-attn 2 to bf16 rounding, is as fast per step on an H100 and
+  1.3 to 1.7 times faster on an RTX PRO 6000 Blackwell. Prediction keeps the
+  construction-time kernel.
+- The best-weights checkpoint stays on the GPU instead of being copied to the
+  host at every improving step, and validation runs under `inference_mode`.
+
+On the largest TabArena tables a step costs about half of what it did, so
+about twice as many of the 50 steps fit a 250 s budget (RTX PRO 6000:
+Diabetes130US 11 to 26 steps, APSFailure 15 to 30, kddcup09_appetency 15 to
+26); tables that already reached 50 steps simply finish sooner.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `MITRA_FT_FAST_LOOP` | `1` | `0` restores the stock loop (all four items off) |
+| `MITRA_FT_ATTENTION` | `sdpa` | `stock` keeps the construction-time attention kernel in the loop |
+| `MITRA_FT_EVAL_CHUNK` | `16384` | query rows per validation chunk (halved under out-of-memory, down to the stock 1,024) |
+| `MITRA_FT_PREFLIGHT` | `1` | `0` skips the memory preflight |
+| `MITRA_FITTED_CONTEXT_MEMO` | `1` | `0` makes every bag child repeat the out-of-memory ratchet |
+
+### Prediction
+
+Stock AutoGluon Mitra predicts in 1,024-row query chunks and re-draws the
+in-context support for every chunk, so a large test set re-encodes the
+support many times. This package predicts in 16,384-row chunks whether or
+not the support fits its cap. When it fits (the common case) the support is
+drawn once per test set, so a single-chunk predict is bit-identical to stock.
+When the training table exceeds the cap, every chunk still gets a fresh
+capped draw, as in stock, so every query row sees exactly one draw and the
+prediction is the same in expectation; measured on the ten TabArena tables
+in that regime (90 splits, paired against the stock chunking on the same
+GPUs): 50 wins, 40 losses, geometric error ratio 1.0001, and 7 times less
+inference time (APSFailure 1,419 s to 185 s per split). Over the whole
+51-dataset suite the total prediction time is 5.2 times lower.
+
+Fine-tuning is untouched by this; only the forward-only prediction path
+changes. On a prediction-time CUDA out-of-memory the query chunk is shrunk
+first (a pure batching change): down to `MITRA_FAST_PREDICT_QCHUNK_FLOOR`
+when the support fits, and to the stock 1,024 rows when it is capped, since
+below that the prediction would only get slower, never different. Only then
+is the support cap halved.
 
 To restore the stock per-chunk behavior, set `MITRA_FAST_PREDICT=0`. The
 relevant environment variables (defaults shown):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `MITRA_FAST_PREDICT` | `1` | `0` disables the speedup (stock per-chunk redraw) |
+| `MITRA_FAST_PREDICT` | `1` | `0` disables the speedup (stock 1,024-row chunks with a redraw each) |
 | `MITRA_FAST_PREDICT_QCHUNK` | `16384` | query rows per prediction chunk |
-| `MITRA_FAST_PREDICT_QCHUNK_FLOOR` | `256` | smallest chunk the OOM fallback will use |
+| `MITRA_FAST_PREDICT_QCHUNK_FLOOR` | `256` | smallest chunk the OOM fallback will use when the support fits |
 
 ### Further speedup for many-chunk prediction: the support cache (opt-in)
 

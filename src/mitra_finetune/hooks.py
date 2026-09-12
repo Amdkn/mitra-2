@@ -18,6 +18,7 @@ import time
 import torch
 from torch import nn
 
+from . import speed as _speed
 from .modes import ViewSpec
 
 WALL_CLOCK_MAX_EPOCHS = 2_147_483_647
@@ -101,13 +102,33 @@ def install_view(view: ViewSpec) -> None:
             self._view_inside_train = False
             self._view_epoch = 0
             self._view_last_metrics = None
+            # Cheaper loop (speed.py): GPU-resident best-weights checkpoint,
+            # cached validation transforms in one wide chunk, memory
+            # preflight, SDPA attention. Same computation per step.
+            self._loop = _speed.LoopSettings.from_env()
+            if self._loop.fast_loop:
+                self.checkpoint = _speed.DeviceCheckpoint()
+                self.checkpoint.reset(self.model)
 
-        def train(self, *args, **kwargs):
+        def train(self, x_train, y_train, x_val, y_val):
             self._view_inside_train = True
             started = time.monotonic()
+            restore_attention = None
+            if self._loop.fast_loop:
+                restore_attention = _speed.set_attention_backend(self.model, self._loop.attention_backend)
+                _speed.clear_eval_cache(self)
             try:
-                return super().train(*args, **kwargs)
+                if (
+                    self._loop.fast_loop
+                    and self._loop.memory_preflight
+                    and str(self.device).startswith("cuda")
+                ):
+                    _speed.memory_preflight(self, x_train)
+                return super().train(x_train, y_train, x_val, y_val)
             finally:
+                if restore_attention is not None:
+                    restore_attention()
+                    _speed.clear_eval_cache(self)
                 self._view_inside_train = False
                 print(
                     f"[mitra-finetune] view={view.name} epochs={self._view_epoch} "
@@ -119,15 +140,24 @@ def install_view(view: ViewSpec) -> None:
             if not self._view_inside_train:
                 return super().evaluate(*args, **kwargs)
             if self._view_last_metrics is None:
-                metrics = super().evaluate(*args, **kwargs)
+                metrics = self._evaluate_in_loop(*args, **kwargs)
                 self._view_last_metrics = metrics
                 return metrics
             self._view_epoch += 1
             if self._view_epoch % view.validation_interval != 0:
                 return self._view_last_metrics
-            metrics = super().evaluate(*args, **kwargs)
+            metrics = self._evaluate_in_loop(*args, **kwargs)
             self._view_last_metrics = metrics
             return metrics
+
+        def _evaluate_in_loop(self, x_support, y_support, x_query, y_query):
+            # The validation pass of one fine-tuning step: stock evaluate, or
+            # the cached-transform / wide-chunk version of speed.py.
+            if not self._loop.fast_loop:
+                return super().evaluate(x_support, y_support, x_query, y_query)
+            return _speed.evaluate_in_loop(
+                self, x_support, y_support, x_query, y_query, self._loop.eval_query_chunk
+            )
 
     # AutoGluon pickles the fitted trainer when saving bagged child models,
     # so the class must be resolvable as mitra_finetune.hooks.ViewTrainer:

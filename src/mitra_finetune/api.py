@@ -122,10 +122,10 @@ class MitraFinetune:
             import warnings
 
             warnings.warn(
-                "flash-attn is not installed; Mitra uses a slower attention "
-                "fallback. Note: the reported benchmarks were calibrated on "
-                "this fallback path, so results remain comparable -- "
-                "installing flash-attn simply trains more steps per budget. "
+                "flash-attn is not installed. Fine-tuning runs on torch's "
+                "scaled_dot_product_attention either way; prediction uses "
+                "flash-attn when it is available, which is faster and uses "
+                "less memory at prediction shapes. "
                 "Install with: pip install flash-attn --no-build-isolation",
                 RuntimeWarning,
                 stacklevel=3,
